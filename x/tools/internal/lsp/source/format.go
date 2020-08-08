@@ -9,71 +9,273 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"go/ast"
 	"go/format"
+	"go/parser"
+	"go/token"
 	"strings"
 
-	"golang.org/x/tools/go/ast/astutil"
-	"golang.org/x/tools/go/packages"
-	"golang.org/x/tools/imports"
+	"golang.org/x/tools/internal/event"
+	"golang.org/x/tools/internal/imports"
 	"golang.org/x/tools/internal/lsp/diff"
-	"golang.org/x/tools/internal/span"
+	"golang.org/x/tools/internal/lsp/protocol"
 )
 
 // Format formats a file with a given range.
-func Format(ctx context.Context, f File, rng span.Range) ([]TextEdit, error) {
-	pkg := f.GetPackage(ctx)
-	if hasParseErrors(pkg.GetErrors()) {
-		return nil, fmt.Errorf("%s has parse errors, not formatting", f.URI())
+func Format(ctx context.Context, snapshot Snapshot, fh FileHandle) ([]protocol.TextEdit, error) {
+	ctx, done := event.Start(ctx, "source.Format")
+	defer done()
+
+	pgf, err := snapshot.ParseGo(ctx, fh, ParseFull)
+	if err != nil {
+		return nil, err
 	}
-	fAST := f.GetAST(ctx)
-	path, exact := astutil.PathEnclosingInterval(fAST, rng.Start, rng.End)
-	if !exact || len(path) == 0 {
-		return nil, fmt.Errorf("no exact AST node matching the specified range")
+	// Even if this file has parse errors, it might still be possible to format it.
+	// Using format.Node on an AST with errors may result in code being modified.
+	// Attempt to format the source of this file instead.
+	if pgf.ParseErr != nil {
+		formatted, err := formatSource(ctx, fh)
+		if err != nil {
+			return nil, err
+		}
+		return computeTextEdits(ctx, snapshot, pgf, string(formatted))
 	}
-	node := path[0]
+
+	fset := snapshot.FileSet()
+
 	// format.Node changes slightly from one release to another, so the version
 	// of Go used to build the LSP server will determine how it formats code.
 	// This should be acceptable for all users, who likely be prompted to rebuild
 	// the LSP server on each Go release.
-	fset := f.GetFileSet(ctx)
 	buf := &bytes.Buffer{}
-	if err := format.Node(buf, fset, node); err != nil {
+	if err := format.Node(buf, fset, pgf.File); err != nil {
 		return nil, err
 	}
-	return computeTextEdits(ctx, f, buf.String()), nil
-}
+	formatted := buf.String()
 
-func hasParseErrors(errors []packages.Error) bool {
-	for _, err := range errors {
-		if err.Kind == packages.ParseError {
-			return true
+	// Apply additional formatting, if any is supported. Currently, the only
+	// supported additional formatter is gofumpt.
+	if format := snapshot.View().Options().Hooks.GofumptFormat; snapshot.View().Options().Gofumpt && format != nil {
+		b, err := format(ctx, buf.Bytes())
+		if err != nil {
+			return nil, err
 		}
+		formatted = string(b)
 	}
-	return false
+	return computeTextEdits(ctx, snapshot, pgf, formatted)
 }
 
-// Imports formats a file using the goimports tool.
-func Imports(ctx context.Context, f File, rng span.Range) ([]TextEdit, error) {
-	formatted, err := imports.Process(f.GetToken(ctx).Name(), f.GetContent(ctx), nil)
+func formatSource(ctx context.Context, fh FileHandle) ([]byte, error) {
+	_, done := event.Start(ctx, "source.formatSource")
+	defer done()
+
+	data, err := fh.Read()
 	if err != nil {
 		return nil, err
 	}
-	return computeTextEdits(ctx, f, string(formatted)), nil
+	return format.Source(data)
 }
 
-func computeTextEdits(ctx context.Context, file File, formatted string) (edits []TextEdit) {
-	u := strings.SplitAfter(string(file.GetContent(ctx)), "\n")
-	f := strings.SplitAfter(formatted, "\n")
-	for _, op := range diff.Operations(u, f) {
-		s := span.New(file.URI(), span.NewPoint(op.I1+1, 1, 0), span.NewPoint(op.I2+1, 1, 0))
-		switch op.Kind {
-		case diff.Delete:
-			// Delete: unformatted[i1:i2] is deleted.
-			edits = append(edits, TextEdit{Span: s})
-		case diff.Insert:
-			// Insert: formatted[j1:j2] is inserted at unformatted[i1:i1].
-			edits = append(edits, TextEdit{Span: s, NewText: strings.Join(op.Content, "")})
+type ImportFix struct {
+	Fix   *imports.ImportFix
+	Edits []protocol.TextEdit
+}
+
+// AllImportsFixes formats f for each possible fix to the imports.
+// In addition to returning the result of applying all edits,
+// it returns a list of fixes that could be applied to the file, with the
+// corresponding TextEdits that would be needed to apply that fix.
+func AllImportsFixes(ctx context.Context, snapshot Snapshot, fh FileHandle) (allFixEdits []protocol.TextEdit, editsPerFix []*ImportFix, err error) {
+	ctx, done := event.Start(ctx, "source.AllImportsFixes")
+	defer done()
+
+	pgf, err := snapshot.ParseGo(ctx, fh, ParseFull)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := snapshot.View().RunProcessEnvFunc(ctx, func(opts *imports.Options) error {
+		allFixEdits, editsPerFix, err = computeImportEdits(ctx, snapshot, pgf, opts)
+		return err
+	}); err != nil {
+		return nil, nil, fmt.Errorf("AllImportsFixes: %v", err)
+	}
+	return allFixEdits, editsPerFix, nil
+}
+
+// computeImportEdits computes a set of edits that perform one or all of the
+// necessary import fixes.
+func computeImportEdits(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile, options *imports.Options) (allFixEdits []protocol.TextEdit, editsPerFix []*ImportFix, err error) {
+	filename := pgf.URI.Filename()
+
+	// Build up basic information about the original file.
+	allFixes, err := imports.FixImports(filename, pgf.Src, options)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	allFixEdits, err = computeFixEdits(snapshot, pgf, options, allFixes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Apply all of the import fixes to the file.
+	// Add the edits for each fix to the result.
+	for _, fix := range allFixes {
+		edits, err := computeFixEdits(snapshot, pgf, options, []*imports.ImportFix{fix})
+		if err != nil {
+			return nil, nil, err
+		}
+		editsPerFix = append(editsPerFix, &ImportFix{
+			Fix:   fix,
+			Edits: edits,
+		})
+	}
+	return allFixEdits, editsPerFix, nil
+}
+
+func computeOneImportFixEdits(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile, fix *imports.ImportFix) ([]protocol.TextEdit, error) {
+	options := &imports.Options{
+		LocalPrefix: snapshot.View().Options().LocalPrefix,
+		// Defaults.
+		AllErrors:  true,
+		Comments:   true,
+		Fragment:   true,
+		FormatOnly: false,
+		TabIndent:  true,
+		TabWidth:   8,
+	}
+	return computeFixEdits(snapshot, pgf, options, []*imports.ImportFix{fix})
+}
+
+func computeFixEdits(snapshot Snapshot, pgf *ParsedGoFile, options *imports.Options, fixes []*imports.ImportFix) ([]protocol.TextEdit, error) {
+	// trim the original data to match fixedData
+	left := importPrefix(pgf.Src)
+	extra := !strings.Contains(left, "\n") // one line may have more than imports
+	if extra {
+		left = string(pgf.Src)
+	}
+	if len(left) > 0 && left[len(left)-1] != '\n' {
+		left += "\n"
+	}
+	// Apply the fixes and re-parse the file so that we can locate the
+	// new imports.
+	flags := parser.ImportsOnly
+	if extra {
+		// used all of origData above, use all of it here too
+		flags = 0
+	}
+	fixedData, err := imports.ApplyFixes(fixes, "", pgf.Src, options, flags)
+	if err != nil {
+		return nil, err
+	}
+	if fixedData == nil || fixedData[len(fixedData)-1] != '\n' {
+		fixedData = append(fixedData, '\n') // ApplyFixes may miss the newline, go figure.
+	}
+	edits := snapshot.View().Options().ComputeEdits(pgf.URI, left, string(fixedData))
+	return ToProtocolEdits(pgf.Mapper, edits)
+}
+
+// importPrefix returns the prefix of the given file content through the final
+// import statement. If there are no imports, the prefix is the package
+// statement and any comment groups below it.
+func importPrefix(src []byte) string {
+	fset := token.NewFileSet()
+	// do as little parsing as possible
+	f, err := parser.ParseFile(fset, "", src, parser.ImportsOnly|parser.ParseComments)
+	if err != nil { // This can happen if 'package' is misspelled
+		return ""
+	}
+	tok := fset.File(f.Pos())
+	var importEnd int
+	for _, d := range f.Decls {
+		if x, ok := d.(*ast.GenDecl); ok && x.Tok == token.IMPORT {
+			if e := tok.Offset(d.End()); e > importEnd {
+				importEnd = e
+			}
 		}
 	}
-	return edits
+
+	maybeAdjustToLineEnd := func(pos token.Pos, isCommentNode bool) int {
+		offset := tok.Offset(pos)
+
+		// Don't go past the end of the file.
+		if offset > len(src) {
+			offset = len(src)
+		}
+		// The go/ast package does not account for different line endings, and
+		// specifically, in the text of a comment, it will strip out \r\n line
+		// endings in favor of \n. To account for these differences, we try to
+		// return a position on the next line whenever possible.
+		switch line := tok.Line(tok.Pos(offset)); {
+		case line < tok.LineCount():
+			nextLineOffset := tok.Offset(tok.LineStart(line + 1))
+			// If we found a position that is at the end of a line, move the
+			// offset to the start of the next line.
+			if offset+1 == nextLineOffset {
+				offset = nextLineOffset
+			}
+		case isCommentNode, offset+1 == tok.Size():
+			// If the last line of the file is a comment, or we are at the end
+			// of the file, the prefix is the entire file.
+			offset = len(src)
+		}
+		return offset
+	}
+	if importEnd == 0 {
+		pkgEnd := f.Name.End()
+		importEnd = maybeAdjustToLineEnd(pkgEnd, false)
+	}
+	for _, c := range f.Comments {
+		if end := tok.Offset(c.End()); end > importEnd {
+			importEnd = maybeAdjustToLineEnd(c.End(), true)
+		}
+	}
+	if importEnd > len(src) {
+		importEnd = len(src)
+	}
+	return string(src[:importEnd])
+}
+
+func computeTextEdits(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile, formatted string) ([]protocol.TextEdit, error) {
+	_, done := event.Start(ctx, "source.computeTextEdits")
+	defer done()
+
+	edits := snapshot.View().Options().ComputeEdits(pgf.URI, string(pgf.Src), formatted)
+	return ToProtocolEdits(pgf.Mapper, edits)
+}
+
+func ToProtocolEdits(m *protocol.ColumnMapper, edits []diff.TextEdit) ([]protocol.TextEdit, error) {
+	if edits == nil {
+		return nil, nil
+	}
+	result := make([]protocol.TextEdit, len(edits))
+	for i, edit := range edits {
+		rng, err := m.Range(edit.Span)
+		if err != nil {
+			return nil, err
+		}
+		result[i] = protocol.TextEdit{
+			Range:   rng,
+			NewText: edit.NewText,
+		}
+	}
+	return result, nil
+}
+
+func FromProtocolEdits(m *protocol.ColumnMapper, edits []protocol.TextEdit) ([]diff.TextEdit, error) {
+	if edits == nil {
+		return nil, nil
+	}
+	result := make([]diff.TextEdit, len(edits))
+	for i, edit := range edits {
+		spn, err := m.RangeSpan(edit.Range)
+		if err != nil {
+			return nil, err
+		}
+		result[i] = diff.TextEdit{
+			Span:    spn,
+			NewText: edit.NewText,
+		}
+	}
+	return result, nil
 }

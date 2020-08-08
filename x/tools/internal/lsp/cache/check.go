@@ -1,237 +1,266 @@
+// Copyright 2019 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package cache
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"go/ast"
-	"go/parser"
-	"go/scanner"
 	"go/types"
-	"io/ioutil"
-	"os"
-	"path/filepath"
+	"path"
+	"sort"
 	"strings"
 	"sync"
 
-	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/internal/event"
+	"golang.org/x/tools/internal/lsp/debug/tag"
+	"golang.org/x/tools/internal/lsp/source"
+	"golang.org/x/tools/internal/memoize"
 	"golang.org/x/tools/internal/span"
+	"golang.org/x/tools/internal/typesinternal"
+	errors "golang.org/x/xerrors"
 )
 
-func (v *View) parse(ctx context.Context, f *File) ([]packages.Error, error) {
-	v.mcache.mu.Lock()
-	defer v.mcache.mu.Unlock()
+type packageHandleKey string
 
-	// Apply any queued-up content changes.
-	if err := v.applyContentChanges(ctx); err != nil {
-		return nil, err
-	}
+type packageHandle struct {
+	handle *memoize.Handle
 
-	// If the package for the file has not been invalidated by the application
-	// of the pending changes, there is no need to continue.
-	if f.isPopulated() {
-		return nil, nil
-	}
-	// Check if the file's imports have changed. If they have, update the
-	// metadata by calling packages.Load.
-	if errs, err := v.checkMetadata(ctx, f); err != nil {
-		return errs, err
-	}
-	if f.meta == nil {
-		return nil, fmt.Errorf("no metadata found for %v", f.filename)
-	}
-	imp := &importer{
-		view:     v,
-		circular: make(map[string]struct{}),
-		ctx:      ctx,
-	}
-	// Start prefetching direct imports.
-	for importPath := range f.meta.children {
-		go imp.Import(importPath)
-	}
-	// Type-check package.
-	pkg, err := imp.typeCheck(f.meta.pkgPath)
-	if pkg == nil || pkg.GetTypes() == nil {
-		return nil, err
-	}
+	goFiles, compiledGoFiles []*parseGoHandle
 
-	// If we still have not found the package for the file, something is wrong.
-	if f.pkg == nil {
-		return nil, fmt.Errorf("parse: no package found for %v", f.filename)
-	}
-	return nil, nil
+	// mode is the mode the the files were parsed in.
+	mode source.ParseMode
+
+	// m is the metadata associated with the package.
+	m *metadata
+
+	// key is the hashed key for the package.
+	key packageHandleKey
 }
 
-func (v *View) cachePackage(ctx context.Context, pkg *Package) {
-	for _, file := range pkg.GetSyntax() {
-		// TODO: If a file is in multiple packages, which package do we store?
-		if !file.Pos().IsValid() {
-			v.Logger().Errorf(ctx, "invalid position for file %v", file.Name)
-			continue
+func (ph *packageHandle) packageKey() packageKey {
+	return packageKey{
+		id:   ph.m.id,
+		mode: ph.mode,
+	}
+}
+
+// packageData contains the data produced by type-checking a package.
+type packageData struct {
+	memoize.NoCopy
+
+	pkg *pkg
+	err error
+}
+
+// buildPackageHandle returns a packageHandle for a given package and mode.
+func (s *snapshot) buildPackageHandle(ctx context.Context, id packageID, mode source.ParseMode) (*packageHandle, error) {
+	if ph := s.getPackage(id, mode); ph != nil {
+		return ph, nil
+	}
+
+	// Build the packageHandle for this ID and its dependencies.
+	ph, deps, err := s.buildKey(ctx, id, mode)
+	if err != nil {
+		return nil, err
+	}
+
+	// Do not close over the packageHandle or the snapshot in the Bind function.
+	// This creates a cycle, which causes the finalizers to never run on the handles.
+	// The possible cycles are:
+	//
+	//     packageHandle.h.function -> packageHandle
+	//     packageHandle.h.function -> snapshot -> packageHandle
+	//
+
+	m := ph.m
+	key := ph.key
+
+	h := s.view.session.cache.store.Bind(key, func(ctx context.Context, arg memoize.Arg) interface{} {
+		snapshot := arg.(*snapshot)
+
+		// Begin loading the direct dependencies, in parallel.
+		var wg sync.WaitGroup
+		for _, dep := range deps {
+			wg.Add(1)
+			go func(dep *packageHandle) {
+				dep.check(ctx, snapshot)
+				wg.Done()
+			}(dep)
 		}
-		tok := v.Config.Fset.File(file.Pos())
-		if tok == nil {
-			v.Logger().Errorf(ctx, "no token.File for %v", file.Name)
-			continue
+
+		data := &packageData{}
+		data.pkg, data.err = typeCheck(ctx, snapshot, m, mode, deps)
+		// Make sure that the workers above have finished before we return,
+		// especially in case of cancellation.
+		wg.Wait()
+
+		return data
+	})
+	ph.handle = h
+
+	// Cache the handle in the snapshot. If a package handle has already
+	// been cached, addPackage will return the cached value. This is fine,
+	// since the original package handle above will have no references and be
+	// garbage collected.
+	ph = s.addPackageHandle(ph)
+
+	return ph, nil
+}
+
+// buildKey computes the key for a given packageHandle.
+func (s *snapshot) buildKey(ctx context.Context, id packageID, mode source.ParseMode) (*packageHandle, map[packagePath]*packageHandle, error) {
+	m := s.getMetadata(id)
+	if m == nil {
+		return nil, nil, errors.Errorf("no metadata for %s", id)
+	}
+	goFiles, err := s.parseGoHandles(ctx, m.goFiles, mode)
+	if err != nil {
+		return nil, nil, err
+	}
+	compiledGoFiles, err := s.parseGoHandles(ctx, m.compiledGoFiles, mode)
+	if err != nil {
+		return nil, nil, err
+	}
+	ph := &packageHandle{
+		m:               m,
+		goFiles:         goFiles,
+		compiledGoFiles: compiledGoFiles,
+		mode:            mode,
+	}
+	// Make sure all of the depList are sorted.
+	depList := append([]packageID{}, m.deps...)
+	sort.Slice(depList, func(i, j int) bool {
+		return depList[i] < depList[j]
+	})
+
+	deps := make(map[packagePath]*packageHandle)
+
+	// Begin computing the key by getting the depKeys for all dependencies.
+	var depKeys []packageHandleKey
+	for _, depID := range depList {
+		mode := source.ParseExported
+		if _, ok := s.isWorkspacePackage(depID); ok {
+			mode = source.ParseFull
 		}
-		fURI := span.FileURI(tok.Name())
-		f, err := v.getFile(fURI)
+		depHandle, err := s.buildPackageHandle(ctx, depID, mode)
 		if err != nil {
-			v.Logger().Errorf(ctx, "no file: %v", err)
+			event.Error(ctx, "no dep handle", err, tag.Package.Of(string(depID)))
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			// One bad dependency should not prevent us from checking the entire package.
+			// Add a special key to mark a bad dependency.
+			depKeys = append(depKeys, packageHandleKey(fmt.Sprintf("%s import not found", id)))
 			continue
 		}
-		f.token = tok
-		f.ast = file
-		f.imports = f.ast.Imports
-		f.pkg = pkg
+		deps[depHandle.m.pkgPath] = depHandle
+		depKeys = append(depKeys, depHandle.key)
 	}
+	ph.key = checkPackageKey(ctx, ph.m.id, compiledGoFiles, m.config, depKeys, mode)
+	return ph, deps, nil
 }
 
-func (v *View) checkMetadata(ctx context.Context, f *File) ([]packages.Error, error) {
-	if v.reparseImports(ctx, f, f.filename) {
-		cfg := v.Config
-		cfg.Mode = packages.LoadImports | packages.NeedTypesSizes
-		pkgs, err := packages.Load(&cfg, fmt.Sprintf("file=%s", f.filename))
-		if len(pkgs) == 0 {
-			if err == nil {
-				err = fmt.Errorf("no packages found for %s", f.filename)
-			}
+func checkPackageKey(ctx context.Context, id packageID, pghs []*parseGoHandle, cfg *packages.Config, deps []packageHandleKey, mode source.ParseMode) packageHandleKey {
+	b := bytes.NewBuffer(nil)
+	b.WriteString(string(id))
+	b.WriteString(hashConfig(cfg))
+	b.WriteByte(byte(mode))
+	for _, dep := range deps {
+		b.WriteString(string(dep))
+	}
+	for _, cgf := range pghs {
+		b.WriteString(string(cgf.file.URI()))
+		b.WriteString(cgf.file.FileIdentity().Hash)
+	}
+	return packageHandleKey(hashContents(b.Bytes()))
+}
+
+// hashConfig returns the hash for the *packages.Config.
+func hashConfig(config *packages.Config) string {
+	b := bytes.NewBuffer(nil)
+
+	// Dir, Mode, Env, BuildFlags are the parts of the config that can change.
+	b.WriteString(config.Dir)
+	b.WriteString(string(rune(config.Mode)))
+
+	for _, e := range config.Env {
+		b.WriteString(e)
+	}
+	for _, f := range config.BuildFlags {
+		b.WriteString(f)
+	}
+	return hashContents(b.Bytes())
+}
+
+func (ph *packageHandle) Check(ctx context.Context, s source.Snapshot) (source.Package, error) {
+	return ph.check(ctx, s.(*snapshot))
+}
+
+func (ph *packageHandle) check(ctx context.Context, s *snapshot) (*pkg, error) {
+	v, err := ph.handle.Get(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	data := v.(*packageData)
+	return data.pkg, data.err
+}
+
+func (ph *packageHandle) CompiledGoFiles() []span.URI {
+	return ph.m.compiledGoFiles
+}
+
+func (ph *packageHandle) ID() string {
+	return string(ph.m.id)
+}
+
+func (ph *packageHandle) Cached() (source.Package, error) {
+	return ph.cached()
+}
+
+func (ph *packageHandle) cached() (*pkg, error) {
+	v := ph.handle.Cached()
+	if v == nil {
+		return nil, errors.Errorf("no cached type information for %s", ph.m.pkgPath)
+	}
+	data := v.(*packageData)
+	return data.pkg, data.err
+}
+
+func (s *snapshot) parseGoHandles(ctx context.Context, files []span.URI, mode source.ParseMode) ([]*parseGoHandle, error) {
+	pghs := make([]*parseGoHandle, 0, len(files))
+	for _, uri := range files {
+		fh, err := s.GetFile(ctx, uri)
+		if err != nil {
 			return nil, err
 		}
-		for _, pkg := range pkgs {
-			// If the package comes back with errors from `go list`, don't bother
-			// type-checking it.
-			if len(pkg.Errors) > 0 {
-				return pkg.Errors, fmt.Errorf("package %s has errors, skipping type-checking", pkg.PkgPath)
-			}
-			v.link(pkg.PkgPath, pkg, nil)
-		}
+		pghs = append(pghs, s.parseGoHandle(ctx, fh, mode))
 	}
-	return nil, nil
+	return pghs, nil
 }
 
-// reparseImports reparses a file's import declarations to determine if they
-// have changed.
-func (v *View) reparseImports(ctx context.Context, f *File, filename string) bool {
-	if f.meta == nil {
-		return true
-	}
-	// Get file content in case we don't already have it?
-	f.read(ctx)
-	parsed, _ := parser.ParseFile(v.Config.Fset, filename, f.content, parser.ImportsOnly)
-	if parsed == nil {
-		return true
-	}
-	if len(f.imports) != len(parsed.Imports) {
-		return true
-	}
-	for i, importSpec := range f.imports {
-		if importSpec.Path.Value != f.imports[i].Path.Value {
-			return true
-		}
-	}
-	return false
-}
+func typeCheck(ctx context.Context, snapshot *snapshot, m *metadata, mode source.ParseMode, deps map[packagePath]*packageHandle) (*pkg, error) {
+	ctx, done := event.Start(ctx, "cache.importer.typeCheck", tag.Package.Of(string(m.id)))
+	defer done()
 
-func (v *View) link(pkgPath string, pkg *packages.Package, parent *metadata) *metadata {
-	m, ok := v.mcache.packages[pkgPath]
-	if !ok {
-		m = &metadata{
-			pkgPath:    pkgPath,
-			id:         pkg.ID,
-			typesSizes: pkg.TypesSizes,
-			parents:    make(map[string]bool),
-			children:   make(map[string]bool),
-		}
-		v.mcache.packages[pkgPath] = m
+	var rawErrors []error
+	for _, err := range m.errors {
+		rawErrors = append(rawErrors, err)
 	}
-	// Reset any field that could have changed across calls to packages.Load.
-	m.name = pkg.Name
-	m.files = pkg.CompiledGoFiles
-	for _, filename := range m.files {
-		if f, _ := v.getFile(span.FileURI(filename)); f != nil {
-			f.meta = m
-		}
-	}
-	// Connect the import graph.
-	if parent != nil {
-		m.parents[parent.pkgPath] = true
-		parent.children[pkgPath] = true
-	}
-	for importPath, importPkg := range pkg.Imports {
-		if _, ok := m.children[importPath]; !ok {
-			v.link(importPath, importPkg, m)
-		}
-	}
-	// Clear out any imports that have been removed.
-	for importPath := range m.children {
-		if _, ok := pkg.Imports[importPath]; !ok {
-			delete(m.children, importPath)
-			if child, ok := v.mcache.packages[importPath]; ok {
-				delete(child.parents, pkgPath)
-			}
-		}
-	}
-	return m
-}
 
-type importer struct {
-	view *View
-
-	// circular maintains the set of previously imported packages.
-	// If we have seen a package that is already in this map, we have a circular import.
-	circular map[string]struct{}
-
-	ctx context.Context
-}
-
-func (imp *importer) Import(pkgPath string) (*types.Package, error) {
-	if _, ok := imp.circular[pkgPath]; ok {
-		return nil, fmt.Errorf("circular import detected")
-	}
-	imp.view.pcache.mu.Lock()
-	e, ok := imp.view.pcache.packages[pkgPath]
-	if ok {
-		// cache hit
-		imp.view.pcache.mu.Unlock()
-		// wait for entry to become ready
-		<-e.ready
-	} else {
-		// cache miss
-		e = &entry{ready: make(chan struct{})}
-		imp.view.pcache.packages[pkgPath] = e
-		imp.view.pcache.mu.Unlock()
-
-		// This goroutine becomes responsible for populating
-		// the entry and broadcasting its readiness.
-		e.pkg, e.err = imp.typeCheck(pkgPath)
-		close(e.ready)
-	}
-	if e.err != nil {
-		return nil, e.err
-	}
-	return e.pkg.types, nil
-}
-
-func (imp *importer) typeCheck(pkgPath string) (*Package, error) {
-	meta, ok := imp.view.mcache.packages[pkgPath]
-	if !ok {
-		return nil, fmt.Errorf("no metadata for %v", pkgPath)
-	}
-	// Use the default type information for the unsafe package.
-	var typ *types.Package
-	if meta.pkgPath == "unsafe" {
-		typ = types.Unsafe
-	} else {
-		typ = types.NewPackage(meta.pkgPath, meta.name)
-	}
-	pkg := &Package{
-		id:         meta.id,
-		pkgPath:    meta.pkgPath,
-		files:      meta.files,
-		imports:    make(map[string]*Package),
-		types:      typ,
-		typesSizes: meta.typesSizes,
+	fset := snapshot.view.session.cache.fset
+	pkg := &pkg{
+		m:               m,
+		mode:            mode,
+		goFiles:         make([]*source.ParsedGoFile, len(m.goFiles)),
+		compiledGoFiles: make([]*source.ParsedGoFile, len(m.compiledGoFiles)),
+		module:          m.module,
+		imports:         make(map[packagePath]*pkg),
+		typesSizes:      m.typesSizes,
 		typesInfo: &types.Info{
 			Types:      make(map[ast.Expr]types.TypeAndValue),
 			Defs:       make(map[*ast.Ident]types.Object),
@@ -240,197 +269,208 @@ func (imp *importer) typeCheck(pkgPath string) (*Package, error) {
 			Selections: make(map[*ast.SelectorExpr]*types.Selection),
 			Scopes:     make(map[ast.Node]*types.Scope),
 		},
-		analyses: make(map[*analysis.Analyzer]*analysisEntry),
 	}
-	appendError := func(err error) {
-		imp.view.appendPkgError(pkg, err)
-	}
-	files, errs := imp.view.parseFiles(meta.files)
-	for _, err := range errs {
-		appendError(err)
-	}
-	pkg.syntax = files
+	var (
+		files        = make([]*ast.File, len(m.compiledGoFiles))
+		parseErrors  = make([]error, len(m.compiledGoFiles))
+		actualErrors = make([]error, len(m.compiledGoFiles))
+		wg           sync.WaitGroup
 
-	// Handle circular imports by copying previously seen imports.
-	newCircular := copySet(imp.circular)
-	newCircular[pkgPath] = struct{}{}
+		mu             sync.Mutex
+		skipTypeErrors bool
+	)
+	for i, cgf := range m.compiledGoFiles {
+		wg.Add(1)
+		go func(i int, cgf span.URI) {
+			defer wg.Done()
+			fh, err := snapshot.GetFile(ctx, cgf)
+			if err != nil {
+				actualErrors[i] = err
+				return
+			}
+			pgh := snapshot.parseGoHandle(ctx, fh, mode)
+			pgf, fixed, err := snapshot.parseGo(ctx, pgh)
+			if err != nil {
+				actualErrors[i] = err
+				return
+			}
+			pkg.compiledGoFiles[i] = pgf
+			files[i], parseErrors[i], actualErrors[i] = pgf.File, pgf.ParseErr, err
+
+			mu.Lock()
+			skipTypeErrors = skipTypeErrors || fixed
+			mu.Unlock()
+		}(i, cgf)
+	}
+	for i, gf := range m.goFiles {
+		wg.Add(1)
+		// We need to parse the non-compiled go files, but we don't care about their errors.
+		go func(i int, gf span.URI) {
+			defer wg.Done()
+			fh, err := snapshot.GetFile(ctx, gf)
+			if err != nil {
+				return
+			}
+			pgf, _ := snapshot.ParseGo(ctx, fh, mode)
+			pkg.goFiles[i] = pgf
+		}(i, gf)
+	}
+	wg.Wait()
+	for _, err := range actualErrors {
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, e := range parseErrors {
+		if e != nil {
+			rawErrors = append(rawErrors, e)
+		}
+	}
+
+	var i int
+	for _, f := range files {
+		if f != nil {
+			files[i] = f
+			i++
+		}
+	}
+	files = files[:i]
+
+	// Use the default type information for the unsafe package.
+	if pkg.m.pkgPath == "unsafe" {
+		pkg.types = types.Unsafe
+		// Don't type check Unsafe: it's unnecessary, and doing so exposes a data
+		// race to Unsafe.completed.
+		return pkg, nil
+	} else if len(files) == 0 { // not the unsafe package, no parsed files
+		// Try to attach errors messages to the file as much as possible.
+		var found bool
+		for _, e := range rawErrors {
+			srcErr, err := sourceError(ctx, snapshot, pkg, e)
+			if err != nil {
+				continue
+			}
+			found = true
+			pkg.errors = append(pkg.errors, srcErr)
+		}
+		if found {
+			return pkg, nil
+		}
+		return nil, errors.Errorf("no parsed files for package %s, expected: %s, list errors: %v", pkg.m.pkgPath, pkg.compiledGoFiles, rawErrors)
+	} else {
+		pkg.types = types.NewPackage(string(m.pkgPath), string(m.name))
+	}
 
 	cfg := &types.Config{
-		Error: appendError,
-		Importer: &importer{
-			view:     imp.view,
-			circular: newCircular,
-			ctx:      imp.ctx,
+		Error: func(e error) {
+			// If we have fixed parse errors in any of the files,
+			// we should hide type errors, as they may be completely nonsensical.
+			if skipTypeErrors {
+				return
+			}
+			rawErrors = append(rawErrors, e)
 		},
+		Importer: importerFunc(func(pkgPath string) (*types.Package, error) {
+			// If the context was cancelled, we should abort.
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			dep := resolveImportPath(pkgPath, pkg, deps)
+			if dep == nil {
+				return nil, errors.Errorf("no package for import %s", pkgPath)
+			}
+			if !isValidImport(m.pkgPath, dep.m.pkgPath) {
+				return nil, errors.Errorf("invalid use of internal package %s", pkgPath)
+			}
+			depPkg, err := dep.check(ctx, snapshot)
+			if err != nil {
+				return nil, err
+			}
+			pkg.imports[depPkg.m.pkgPath] = depPkg
+			return depPkg.types, nil
+		}),
 	}
-	check := types.NewChecker(cfg, imp.view.Config.Fset, pkg.types, pkg.typesInfo)
-	check.Files(pkg.syntax)
+	// We want to type check cgo code if go/types supports it.
+	// We passed typecheckCgo to go/packages when we Loaded.
+	typesinternal.SetUsesCgo(cfg)
 
-	// Add every file in this package to our cache.
-	imp.view.cachePackage(imp.ctx, pkg)
+	check := types.NewChecker(cfg, fset, pkg.types, pkg.typesInfo)
 
-	// Set imports of package to correspond to cached packages.
-	// We lock the package cache, but we shouldn't get any inconsistencies
-	// because we are still holding the lock on the view.
-	imp.view.pcache.mu.Lock()
-	defer imp.view.pcache.mu.Unlock()
+	// Type checking errors are handled via the config, so ignore them here.
+	_ = check.Files(files)
+	// If the context was cancelled, we may have returned a ton of transient
+	// errors to the type checker. Swallow them.
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 
-	for importPath := range meta.children {
-		if importEntry, ok := imp.view.pcache.packages[importPath]; ok {
-			pkg.imports[importPath] = importEntry.pkg
+	// We don't care about a package's errors unless we have parsed it in full.
+	if mode == source.ParseFull {
+		for _, e := range rawErrors {
+			srcErr, err := sourceError(ctx, snapshot, pkg, e)
+			if err != nil {
+				event.Error(ctx, "unable to compute error positions", err, tag.Package.Of(pkg.ID()))
+				continue
+			}
+			pkg.errors = append(pkg.errors, srcErr)
+			if err, ok := e.(types.Error); ok {
+				pkg.typeErrors = append(pkg.typeErrors, err)
+			}
 		}
 	}
 
 	return pkg, nil
 }
 
-func copySet(m map[string]struct{}) map[string]struct{} {
-	result := make(map[string]struct{})
-	for k, v := range m {
-		result[k] = v
+// resolveImportPath resolves an import path in pkg to a package from deps.
+// It should produce the same results as resolveImportPath:
+// https://cs.opensource.google/go/go/+/master:src/cmd/go/internal/load/pkg.go;drc=641918ee09cb44d282a30ee8b66f99a0b63eaef9;l=990.
+func resolveImportPath(importPath string, pkg *pkg, deps map[packagePath]*packageHandle) *packageHandle {
+	if dep := deps[packagePath(importPath)]; dep != nil {
+		return dep
 	}
-	return result
+	// We may be in GOPATH mode, in which case we need to check vendor dirs.
+	searchDir := path.Dir(pkg.PkgPath())
+	for {
+		vdir := packagePath(path.Join(searchDir, "vendor", importPath))
+		if vdep := deps[vdir]; vdep != nil {
+			return vdep
+		}
+
+		// Search until Dir doesn't take us anywhere new, e.g. "." or "/".
+		next := path.Dir(searchDir)
+		if searchDir == next {
+			break
+		}
+		searchDir = next
+	}
+
+	// Vendor didn't work. Let's try minimal module compatibility mode.
+	// In MMC, the packagePath is the canonical (.../vN/...) path, which
+	// is hard to calculate. But the go command has already resolved the ID
+	// to the non-versioned path, and we can take advantage of that.
+	for _, dep := range deps {
+		if dep.ID() == importPath {
+			return dep
+		}
+	}
+	return nil
 }
 
-func (v *View) appendPkgError(pkg *Package, err error) {
-	if err == nil {
-		return
-	}
-	var errs []packages.Error
-	switch err := err.(type) {
-	case *scanner.Error:
-		errs = append(errs, packages.Error{
-			Pos:  err.Pos.String(),
-			Msg:  err.Msg,
-			Kind: packages.ParseError,
-		})
-	case scanner.ErrorList:
-		// The first parser error is likely the root cause of the problem.
-		if err.Len() > 0 {
-			errs = append(errs, packages.Error{
-				Pos:  err[0].Pos.String(),
-				Msg:  err[0].Msg,
-				Kind: packages.ParseError,
-			})
-		}
-	case types.Error:
-		errs = append(errs, packages.Error{
-			Pos:  v.Config.Fset.Position(err.Pos).String(),
-			Msg:  err.Msg,
-			Kind: packages.TypeError,
-		})
-	}
-	pkg.errors = append(pkg.errors, errs...)
-}
-
-// We use a counting semaphore to limit
-// the number of parallel I/O calls per process.
-var ioLimit = make(chan bool, 20)
-
-// parseFiles reads and parses the Go source files and returns the ASTs
-// of the ones that could be at least partially parsed, along with a
-// list of I/O and parse errors encountered.
-//
-// Because files are scanned in parallel, the token.Pos
-// positions of the resulting ast.Files are not ordered.
-//
-func (v *View) parseFiles(filenames []string) ([]*ast.File, []error) {
-	var wg sync.WaitGroup
-	n := len(filenames)
-	parsed := make([]*ast.File, n)
-	errors := make([]error, n)
-	for i, filename := range filenames {
-		if v.Config.Context.Err() != nil {
-			parsed[i] = nil
-			errors[i] = v.Config.Context.Err()
-			continue
-		}
-
-		// First, check if we have already cached an AST for this file.
-		f, err := v.findFile(span.FileURI(filename))
-		if err != nil {
-			parsed[i], errors[i] = nil, err
-		}
-		var fAST *ast.File
-		if f != nil {
-			fAST = f.ast
-		}
-
-		wg.Add(1)
-		go func(i int, filename string) {
-			ioLimit <- true // wait
-
-			if fAST != nil {
-				parsed[i], errors[i] = fAST, nil
-			} else {
-				// We don't have a cached AST for this file.
-				var src []byte
-				// Check for an available overlay.
-				for f, contents := range v.Config.Overlay {
-					if sameFile(f, filename) {
-						src = contents
-					}
-				}
-				var err error
-				// We don't have an overlay, so we must read the file's contents.
-				if src == nil {
-					src, err = ioutil.ReadFile(filename)
-				}
-				if err != nil {
-					parsed[i], errors[i] = nil, err
-				} else {
-					// ParseFile may return both an AST and an error.
-					parsed[i], errors[i] = v.Config.ParseFile(v.Config.Fset, filename, src)
-				}
-			}
-
-			<-ioLimit // signal
-			wg.Done()
-		}(i, filename)
-	}
-	wg.Wait()
-
-	// Eliminate nils, preserving order.
-	var o int
-	for _, f := range parsed {
-		if f != nil {
-			parsed[o] = f
-			o++
-		}
-	}
-	parsed = parsed[:o]
-
-	o = 0
-	for _, err := range errors {
-		if err != nil {
-			errors[o] = err
-			o++
-		}
-	}
-	errors = errors[:o]
-
-	return parsed, errors
-}
-
-// sameFile returns true if x and y have the same basename and denote
-// the same file.
-//
-func sameFile(x, y string) bool {
-	if x == y {
-		// It could be the case that y doesn't exist.
-		// For instance, it may be an overlay file that
-		// hasn't been written to disk. To handle that case
-		// let x == y through. (We added the exact absolute path
-		// string to the CompiledGoFiles list, so the unwritten
-		// overlay case implies x==y.)
+func isValidImport(pkgPath, importPkgPath packagePath) bool {
+	i := strings.LastIndex(string(importPkgPath), "/internal/")
+	if i == -1 {
 		return true
 	}
-	if strings.EqualFold(filepath.Base(x), filepath.Base(y)) { // (optimisation)
-		if xi, err := os.Stat(x); err == nil {
-			if yi, err := os.Stat(y); err == nil {
-				return os.SameFile(xi, yi)
-			}
-		}
+	if pkgPath == "command-line-arguments" {
+		return true
 	}
-	return false
+	return strings.HasPrefix(string(pkgPath), string(importPkgPath[:i]))
 }
+
+// An importFunc is an implementation of the single-method
+// types.Importer interface based on a function value.
+type importerFunc func(path string) (*types.Package, error)
+
+func (f importerFunc) Import(path string) (*types.Package, error) { return f(path) }

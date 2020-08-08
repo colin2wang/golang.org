@@ -9,23 +9,13 @@ import (
 	"flag"
 	"fmt"
 
-	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/span"
+	errors "golang.org/x/xerrors"
 )
 
 // check implements the check verb for gopls.
 type check struct {
 	app *Application
-}
-
-type checkClient struct {
-	baseClient
-	diagnostics chan entry
-}
-
-type entry struct {
-	uri         span.URI
-	diagnostics []protocol.Diagnostic
 }
 
 func (c *check) Name() string      { return "check" }
@@ -49,49 +39,37 @@ func (c *check) Run(ctx context.Context, args ...string) error {
 		// no files, so no results
 		return nil
 	}
-	client := &checkClient{
-		diagnostics: make(chan entry),
-	}
-	checking := map[span.URI]*protocol.ColumnMapper{}
+	checking := map[span.URI]*cmdFile{}
+	var uris []span.URI
 	// now we ready to kick things off
-	_, err := c.app.connect(ctx, client)
+	conn, err := c.app.connect(ctx)
 	if err != nil {
 		return err
 	}
+	defer conn.terminate(ctx)
 	for _, arg := range args {
-		uri := span.FileURI(arg)
-		m, err := client.AddFile(ctx, uri)
-		if err != nil {
-			return err
+		uri := span.URIFromPath(arg)
+		uris = append(uris, uri)
+		file := conn.AddFile(ctx, uri)
+		if file.err != nil {
+			return file.err
 		}
-		checking[uri] = m
+		checking[uri] = file
 	}
-	// now wait for results
-	for entry := range client.diagnostics {
-		//TODO:timeout?
-		m, found := checking[entry.uri]
-		if !found {
-			continue
-		}
-		for _, d := range entry.diagnostics {
-			spn, err := m.RangeSpan(d.Range)
+	if err := conn.diagnoseFiles(ctx, uris); err != nil {
+		return err
+	}
+	conn.Client.filesMu.Lock()
+	defer conn.Client.filesMu.Unlock()
+
+	for _, file := range checking {
+		for _, d := range file.diagnostics {
+			spn, err := file.mapper.RangeSpan(d.Range)
 			if err != nil {
-				return fmt.Errorf("Could not convert position %v for %q", d.Range, d.Message)
+				return errors.Errorf("Could not convert position %v for %q", d.Range, d.Message)
 			}
 			fmt.Printf("%v: %v\n", spn, d.Message)
 		}
-		delete(checking, entry.uri)
-		if len(checking) == 0 {
-			return nil
-		}
-	}
-	return fmt.Errorf("did not get all results")
-}
-
-func (c *checkClient) PublishDiagnostics(ctx context.Context, p *protocol.PublishDiagnosticsParams) error {
-	c.diagnostics <- entry{
-		uri:         span.URI(p.URI),
-		diagnostics: p.Diagnostics,
 	}
 	return nil
 }

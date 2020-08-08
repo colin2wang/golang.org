@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/internal/testenv"
 )
 
 func TestChanges(t *testing.T) {
@@ -26,22 +27,24 @@ func TestChanges(t *testing.T) {
 	sort.Strings(wanti)
 	sort.Strings(wantc)
 
-	oldpkg, err := load("apidiff/old", dir)
+	oldpkg, err := load(t, "apidiff/old", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	newpkg, err := load("apidiff/new", dir)
+	newpkg, err := load(t, "apidiff/new", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	report := Changes(oldpkg.Types, newpkg.Types)
 
-	if !reflect.DeepEqual(report.Incompatible, wanti) {
-		t.Errorf("incompatibles: got %v\nwant %v\n", report.Incompatible, wanti)
+	got := report.messages(false)
+	if !reflect.DeepEqual(got, wanti) {
+		t.Errorf("incompatibles: got %v\nwant %v\n", got, wanti)
 	}
-	if !reflect.DeepEqual(report.Compatible, wantc) {
-		t.Errorf("compatibles: got %v\nwant %v\n", report.Compatible, wantc)
+	got = report.messages(true)
+	if !reflect.DeepEqual(got, wantc) {
+		t.Errorf("compatibles: got %v\nwant %v\n", got, wantc)
 	}
 }
 
@@ -113,7 +116,9 @@ func splitIntoPackages(t *testing.T, dir string) (incompatibles, compatibles []s
 	return
 }
 
-func load(importPath, goPath string) (*packages.Package, error) {
+func load(t *testing.T, importPath, goPath string) (*packages.Package, error) {
+	testenv.NeedsGoPackages(t)
+
 	cfg := &packages.Config{
 		Mode: packages.LoadTypes,
 	}
@@ -132,7 +137,7 @@ func load(importPath, goPath string) (*packages.Package, error) {
 }
 
 func TestExportedFields(t *testing.T) {
-	pkg, err := load("golang.org/x/tools/internal/apidiff/testdata/exported_fields", "")
+	pkg, err := load(t, "golang.org/x/tools/internal/apidiff/testdata/exported_fields", "")
 	if err != nil {
 		t.Fatal(err)
 	}
